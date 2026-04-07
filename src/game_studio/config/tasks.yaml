@@ -1,0 +1,189 @@
+validate_connection_task:
+  description: >
+    Validate connectivity to the target database.
+    You MUST use the `validate_database_connection` tool with:
+    - database_type: {database_type}
+    - connection_uri: {connection_uri}
+    Return the tool output as-is and clearly state whether the connection succeeded.
+  expected_output: >
+    A clear confirmation of whether the database connection succeeded, including details.
+
+normalize_question_task:
+  description: >
+    Normalize the user's question for analytics.
+    User Question: {user_question}
+  expected_output: >
+    A normalized, clear analytical question in English.
+
+extract_schema_task:
+  description: >
+    Discover the available tables in ClickHouse Cloud using `get_clickhouse_table_names`.
+    Identify the names of the tables that are currently available in the data warehouse.
+    Do NOT fetch full column details yet.
+  expected_output: >
+    A simple list of table names found in ClickHouse.
+
+extract_table_data_task:
+  description: >
+    Extract table rows into the ClickHouse Data Warehouse using `sync_to_clickhouse`.
+    - connection_uri: {connection_uri}
+    - max_rows_per_table: {max_rows_per_table}
+    - session_id: {session_id}
+    Confirm that the House tables were successfully generated and return the list of table names.
+  expected_output: >
+    A structured extraction summary with the synced ClickHouse table names, or JSON fallback status.
+
+analyze_schema_relevance_task:
+  description: >
+    Analyze the list of ClickHouse table names to identify which 2-3 tables are 
+    most relevant for answering the user's question: {user_question}.
+    If you need column details to be sure, list the tables you want to inspect.
+  expected_output: >
+    A list of 2-3 specific table names that are likely to contain the answer.
+
+plan_query_dispatch_task:
+  description: >
+    Create a technical SQL query plan for: {user_question}
+    Based on the relevant schema identified, plan the exact SQL queries 
+    needed to compute the final answer.
+    THE TABLES ARE IN CLICKHOUSE CLOUD. DO NOT ATTEMPT TO READ THEM AS LOCAL FILES. 
+    Use the table names identified in the relevance task.
+  expected_output: >
+    A structured SQL execution plan for ClickHouse.
+
+analyze_and_compute_task:
+  description: >
+    Answer this question using real data: {user_question}
+
+    THE DATA IS ALREADY IN CLICKHOUSE. DO NOT ATTEMPT TO SYNC OR DOWNLOAD DATA.
+
+    Step 1 — Obtain the detailed schema for the RELEVANT tables only. 
+             Use `get_clickhouse_schema` providing the `table_names` identified in the relevance task.
+             Example: get_clickhouse_schema(table_names=["dev_film", "dev_category"])
+             This is CRITICAL for speed—never fetch all tables.
+
+    Step 2 — Use `clickhouse_query_tool` to compute the answer.
+             Write an optimized SELECT query to run against the ClickHouse Data Warehouse. 
+             Use the prefixed ClickHouse table names (e.g. dev_table_name).
+             sql_query = <SELECT ... GROUP BY ...>
+
+    Step 3 — Report the exact numbers from the tool result. Never invent data.
+
+    RULES:
+    - NEVER simulate or guess numbers.
+    - AGGREGATION RULE: If answering a trend question (e.g., "Daily/Monthly sales"), and the number of days is large (> 40), you MUST aggregate the results by **Week** or **Month** using SQL logic or group-by.
+  expected_output: >
+    A markdown report with the exact computed numbers from the tool.
+  markdown: true
+
+synthesize_response_task:
+  description: >
+    Write the final answer for: {user_question}
+
+    Step 1 — Write a clear, professional markdown answer using real numbers from the analysis context.
+             Use headers (###), bolding for key findings, and bullet points.
+
+    RULES:
+    - Only use numbers from the analysis context — never invent data.
+    - FOR FORMULAS: Use standard LaTeX notation wrapped in $$ for blocks (e.g., $$ Result = X \times Y $$) or $ for inline.
+    - LANGUAGE: Respond STRICTLY in the exact same language the user used in their question.
+  expected_output: >
+    A plain markdown answer with real numbers (no "Final Answer" prefix).
+  output_file: output/final_response.md
+  markdown: true
+
+visual_report_task:
+  description: >
+    Create visuals for: {user_question}
+
+    PART A — Charts
+    Create one comprehensive visualization for each unique dimension (X-axis) found in the data. For each dimension, call save_chart_data:
+      chart_id  = <unique snake_case id, e.g. "revenue_by_category">
+      labels    = <list of category/group name strings>
+      series    = <list of series objects, e.g. [{"name": "Revenue", "type": "bar", "values": [...]}]>
+      chart_type = "combo" | "bar" | "pie" | "line" | "area" | "gauge"
+      title     = <descriptive title>
+      xlabel    = <x-axis label>
+      ylabel    = <y-axis label>
+    RULES: If multiple metrics share an X-axis, consolidate them into ONE chart. If there are multiple distinct X-axes (e.g. "by Rating" AND "by Category"), call save_chart_data ONCE PER AXIS.
+
+    PART B — KPI Metric Cards
+    After saving charts, call save_metrics ONCE.
+    The "metrics" argument MUST be a JSON array encoded as a single STRING (not a list).
+    Each element is an object with:
+      "label"     (required) — short title, e.g. "Total Revenue"
+      "value"     (required) — main display value, e.g. "4,200" or "81%"
+      "color"     (optional) — "green", "red", "orange", or "blue"
+      "sub_value" (optional) — secondary number, e.g. "4,500 transactions"
+      "delta"     (optional) — change string, e.g. "+5.1%" or "-3.2%"
+      "delta_up"  (optional) — true if positive/good, false if negative/bad
+
+    Example — pass this exact string format to save_metrics:
+      metrics = '[{"label": "Total Revenue", "value": "$4,200", "color": "green", "delta": "+5.1%", "delta_up": true}, {"label": "Top Category", "value": "Action", "sub_value": "64 films", "color": "blue"}, {"label": "Avg Rental Rate", "value": "$2.98", "color": "blue"}]'
+
+    RULES:
+    - MULTI-DIMENSIONAL RULE: You are permitted ONE call to 'save_chart_data' per unique X-axis dimension. If the data grouping is by 'Category', create one chart. If it is also by 'Rating', create a second chart with its own data.
+    - CONSOLIDATION RULE: If multiple metrics (e.g., Total Revenue and Count of Movies) share the same X-axis labels (e.g., "by Category"), you MUST consolidate them into a SINGLE chart using the 'combo' type. No separate charts for related data on the same axis.
+    - Limit to a maximum of 3 unique dimension charts per response to maintain focus.
+    - For consolidated charts, use 'bar' for one series and 'line' for another to make them distinct.
+    - GAUGE RULE: Use chart_type "gauge" ONLY when the result is a single numeric KPI value (like a percentage, score, or rate). The series should contain exactly one series item with exactly one value. Set a "target" field at the top level if a comparison target is available. Do NOT use gauge for multi-category or multi-point data.
+    - AREA RULE: Use chart_type "area" for time-series or trend data where showing the filled area below the line adds visual emphasis (e.g., cumulative totals, volume over time). Use series type "area" for area series.
+    - DATA DENSITY RULE: Limit any single chart to a maximum of **30-40 data points** to prevent technical failures and ensure readability.
+    - For time-series data: If the daily data is too large, aggregate it by **Week** or **Month**.
+    - For categories: If there are too many (e.g., more than 20), only show the **Top 15** and group others into "Other" or simply state they are the leading categories.
+    - Verification Step: Double-check that every float in save_chart_data and every value in save_metrics exists in the provided context results.
+    - The metrics argument is a STRING containing valid JSON, not a Python list.
+    - Keep metric labels short (2–4 words max).
+    - Produce 3–6 metrics that best summarize the answer.
+  expected_output: >
+    A markdown insight summary, with charts saved via save_chart_data and KPIs saved via save_metrics.
+  markdown: true
+
+architect_dashboard_task:
+  description: >
+    Step 1: Discover table names using `get_clickhouse_table_names`.
+    Step 2: Identify 2-3 relevant tables and get their schema using `get_clickhouse_schema`.
+    Step 3: Based on the user's dashboard request: "{user_question}",
+    design the dashboard widgets according to the instructions in the request.
+
+    Supported widget types:
+    - "metric"       — Simple KPI card with a single number.
+    - "big_metric"   — Large featured KPI card with value and optional delta comparison.
+    - "metric_chart" — Large metric value displayed above an embedded chart.
+                       The question MUST ask for a trend or breakdown that produces both a single headline number AND chart-worthy data.
+    - "metric_table" — Multiple related metrics shown as rows in a table (Metric | Value | vs prev).
+                       The question MUST ask for a breakdown or comparison that yields 4–6 distinct numeric results.
+    - "bar"          — Bar chart visualization.
+    - "pie"          — Pie chart visualization.
+    - "line"         — Line chart visualization.
+
+    Rules:
+    - Each widget must be answerable from the schema.
+    - Output ONLY a valid JSON array of objects.
+    - Each object MUST have exactly these keys: "title", "question", and "type".
+    - Follow the EXACT widget count, types, and order specified in the request.
+    - If no specific structure is given, default to 10 metrics + 6 charts (bar/pie/line).
+
+    Example output:
+    [
+      {{"title": "Total Revenue", "question": "What is the total revenue?", "type": "big_metric"}},
+      {{"title": "Customer Trend", "question": "How many new customers per month?", "type": "metric_chart"}},
+      {{"title": "Revenue Breakdown", "question": "What is revenue by category?", "type": "metric_table"}}
+    ]
+  expected_output: >
+    A valid JSON array of widget objects matching the requested structure.
+
+generate_suggestions_task:
+  description: >
+    Step 1: Discover table names using `get_clickhouse_table_names`.
+    Step 2: Generate exactly 4 short analytical follow-up questions...
+ 
+    Conversation context:
+    - Last question asked: {user_question}
+ 
+    Rules:
+    - Each question must be directly answerable from the database schema
+    - Each question must be under 12 words
+    - Output ONLY a valid JSON array of 4 strings, nothing else
+  expected_output: >
+    A valid JSON array of exactly 4 question strings, with no extra text.

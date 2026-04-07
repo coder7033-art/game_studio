@@ -1,0 +1,38 @@
+[project]
+name = "game_studio"
+version = "0.1.0"
+description = "game_studio using crewAI"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "crewai[tools,litellm]==1.13.0",
+    "sqlalchemy>=2.0,<3.0",
+    "psycopg[binary]>=3.2,<4.0",
+    "pymysql>=1.1,<2.0",
+    "streamlit>=1.43,<2.0",
+    "python-dotenv>=1.1.1",
+    "matplotlib>=3.10.8",
+    "pandas>=2.3.3",
+    "plotly>=6.6.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sse-starlette>=2.1",
+    "python-multipart>=0.0.12",
+    "clickhouse-connect>=0.15.1",
+]
+
+[project.scripts]
+game_studio = "game_studio.main:run"
+run_crew = "game_studio.main:run"
+train = "game_studio.main:train"
+replay = "game_studio.main:replay"
+test = "game_studio.main:test"
+run_with_trigger = "game_studio.main:run_with_trigger"
+ui = "game_studio.ui:launch"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.crewai]
+type = "crew"
