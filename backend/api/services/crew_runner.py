@@ -23,6 +23,11 @@ from typing import Any
 
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysbd")
 
+# Global lock to prevent concurrent crew executions
+# This prevents resource conflicts when multiple crews try to run simultaneously
+_crew_execution_lock = threading.Lock()
+_crew_execution_active = False
+
 # Stage markers — same as in ui.py
 _AGENT_STAGES = [
     {"id": "analyze",    "marker": "output/data_analysis.md"},
@@ -123,10 +128,24 @@ async def run_crew_streaming(inputs: dict[str, Any]) -> asyncio.Queue:
     Starts a background thread that runs CrewAI, returning an asyncio.Queue
     that yields SSE event dicts until a "done" or "error" event is produced.
     """
+    global _crew_execution_active
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[dict] = asyncio.Queue()
 
+    # Check if another crew is already running
+    with _crew_execution_lock:
+        if _crew_execution_active:
+            # Another crew is running, return error immediately
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {"type": "error", "message": "Another analysis is already in progress. Please wait."},
+            )
+            loop.call_soon_threadsafe(queue.put_nowait, {"type": "done"})
+            return queue
+        _crew_execution_active = True
+
     def _thread_work() -> None:
+        global _crew_execution_active
         try:
             from game_studio.crew import GameStudio
             from backend.api.services.output_reader import (
@@ -207,6 +226,9 @@ async def run_crew_streaming(inputs: dict[str, Any]) -> asyncio.Queue:
                 {"type": "error", "message": str(exc)},
             )
         finally:
+            # Release the execution lock so other crews can run
+            with _crew_execution_lock:
+                _crew_execution_active = False
             loop.call_soon_threadsafe(queue.put_nowait, {"type": "done"})
 
     thread = threading.Thread(target=_thread_work, daemon=True)
@@ -219,26 +241,40 @@ async def run_suggestions(inputs: dict[str, Any]) -> list[str]:
     Runs suggestions_crew in a thread pool executor (not streaming).
     Returns a list of 4 suggestion strings.
     """
+    global _crew_execution_active
     loop = asyncio.get_running_loop()
 
+    # Check if another crew is already running - skip suggestions if so
+    with _crew_execution_lock:
+        if _crew_execution_active:
+            # Another crew is running, return empty suggestions silently
+            return []
+        _crew_execution_active = True
+
     def _run() -> list[str]:
-        from game_studio.crew import GameStudio
-        inputs.setdefault("session_id", "dev")
-        _reset_crewai_event_context()
-        result = GameStudio().suggestions_crew().kickoff(inputs=inputs)
-        _reset_crewai_event_context()
-        # Result may be a string (JSON array) or a CrewOutput object
-        raw = str(result) if result else "[]"
-        # Try to parse as JSON array
+        global _crew_execution_active
         try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                return [str(s) for s in data]
-        except json.JSONDecodeError:
-            pass
-        # Fallback: split by newlines
-        lines = [l.strip().lstrip("-•*").strip() for l in raw.splitlines() if l.strip()]
-        return lines[:4]
+            from game_studio.crew import GameStudio
+            inputs.setdefault("session_id", "dev")
+            _reset_crewai_event_context()
+            result = GameStudio().suggestions_crew().kickoff(inputs=inputs)
+            _reset_crewai_event_context()
+            # Result may be a string (JSON array) or a CrewOutput object
+            raw = str(result) if result else "[]"
+            # Try to parse as JSON array
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return [str(s) for s in data]
+            except json.JSONDecodeError:
+                pass
+            # Fallback: split by newlines
+            lines = [l.strip().lstrip("-•*").strip() for l in raw.splitlines() if l.strip()]
+            return lines[:4]
+        finally:
+            # Release the execution lock
+            with _crew_execution_lock:
+                _crew_execution_active = False
 
     return await loop.run_in_executor(None, _run)
 
@@ -248,21 +284,35 @@ async def run_dashboard_planner(inputs: dict[str, Any]) -> list[dict]:
     Runs dashboard_planner_crew in a thread pool executor.
     Returns a list of widget dicts.
     """
+    global _crew_execution_active
     loop = asyncio.get_running_loop()
 
+    # Check if another crew is already running
+    with _crew_execution_lock:
+        if _crew_execution_active:
+            # Another crew is running, return empty result
+            return []
+        _crew_execution_active = True
+
     def _run() -> list[dict]:
-        from game_studio.crew import GameStudio
-        inputs.setdefault("session_id", "dev")
-        _reset_crewai_event_context()
-        result = GameStudio().dashboard_planner_crew().kickoff(inputs=inputs)
-        _reset_crewai_event_context()
-        raw = str(result) if result else "[]"
+        global _crew_execution_active
         try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                return data
-        except json.JSONDecodeError:
-            pass
-        return []
+            from game_studio.crew import GameStudio
+            inputs.setdefault("session_id", "dev")
+            _reset_crewai_event_context()
+            result = GameStudio().dashboard_planner_crew().kickoff(inputs=inputs)
+            _reset_crewai_event_context()
+            raw = str(result) if result else "[]"
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    return data
+            except json.JSONDecodeError:
+                pass
+            return []
+        finally:
+            # Release the execution lock
+            with _crew_execution_lock:
+                _crew_execution_active = False
 
     return await loop.run_in_executor(None, _run)
