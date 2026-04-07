@@ -95,15 +95,9 @@ analyze_and_compute_task:
              sql_query = <SELECT ... GROUP BY ...>
 
     Step 4 — DATA GROUNDING RULE:
-             At the end of your analysis, provide a concise "INTERNAL SUMMARY" that includes:
-             1. Core aggregates (e.g. Total Revenue, Average Rate)
-             2. **MULTI-DIMENSION AGGREGATES**: If the question asks for breakdown by MULTIPLE dimensions 
-                (e.g. "by rating AND by genre"), you MUST provide separate aggregated totals for EACH dimension.
-                Example: If asked "revenue by rating and genre", provide:
-                - Aggregates by Rating: {G: 403.26, NC-17: 239.48, ...}
-                - Aggregates by Genre: {Action: 162.82, Comedy: 96.82, ...}
-             These numbers MUST be used by the visual_reporter to ensure 100% fidelity and to create 
-             one chart per dimension.
+             At the end of your analysis, provide a concise "INTERNAL SUMMARY" of the core aggregates 
+             (e.g. Total Revenue, Average Rate). 
+             These numbers MUST be used by the visual_reporter to ensure 100% fidelity.
     
     RULES:
     - NEVER simulate or guess numbers.
