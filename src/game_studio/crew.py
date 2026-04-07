@@ -23,6 +23,8 @@ from game_studio.tools import (
 class GameStudio:
     """Database analysis multi-agent crew."""
 
+    _verbose = os.getenv("DEBUG_MODE", "False").lower() == "true"
+
     agents: List[BaseAgent]
     tasks: List[Task]
 
@@ -80,7 +82,7 @@ class GameStudio:
             config=self.agents_config["db_connection_engineer"],  # type: ignore[index]
             tools=[ValidateDatabaseConnectionTool()],
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
@@ -89,7 +91,7 @@ class GameStudio:
             config=self.agents_config["schema_documenter"],  # type: ignore[index]
             tools=[GetClickHouseTableNamesTool()],
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
@@ -98,16 +100,16 @@ class GameStudio:
             config=self.agents_config["table_data_extractor"],  # type: ignore[index]
             tools=[SyncToClickHouseTool()],
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
     def schema_analyst(self) -> Agent:
         return Agent(
             config=self.agents_config["schema_analyst"],  # type: ignore[index]
-            tools=[GetClickHouseTableNamesTool(), GetClickHouseSchemaTool()],
+            tools=[GetClickHouseSchemaTool()],
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
@@ -116,7 +118,7 @@ class GameStudio:
             config=self.agents_config["data_analyst"],  # type: ignore[index]
             tools=[ClickHouseQueryTool(), GetClickHouseSchemaTool()],
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
@@ -124,7 +126,7 @@ class GameStudio:
         return Agent(
             config=self.agents_config["question_normalizer"],  # type: ignore[index]
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
@@ -132,16 +134,15 @@ class GameStudio:
         return Agent(
             config=self.agents_config["query_dispatcher"],  # type: ignore[index]
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
     def suggestions_agent(self) -> Agent:
         return Agent(
             config=self.agents_config["suggestions_agent"],  # type: ignore[index]
-            tools=[GetClickHouseTableNamesTool()],
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
@@ -150,7 +151,7 @@ class GameStudio:
             config=self.agents_config["visual_reporter"],  # type: ignore[index]
             tools=[SaveChartDataTool(), SaveMetricsTool()],
             llm=self.llm_extended(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
@@ -158,7 +159,7 @@ class GameStudio:
         return Agent(
             config=self.agents_config["response_synthesizer"],  # type: ignore[index]
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @agent
@@ -167,7 +168,7 @@ class GameStudio:
             config=self.agents_config["dashboard_architect"],  # type: ignore[index]
             tools=[GetClickHouseTableNamesTool(), GetClickHouseSchemaTool()],
             llm=self.llm(),
-            verbose=True,
+            verbose=self._verbose,
         )
 
     @task
@@ -182,6 +183,14 @@ class GameStudio:
         return Task(
             config=self.tasks_config["normalize_question_task"],  # type: ignore[index]
             agent=self.question_normalizer(),
+        )
+ 
+    @task
+    def resolve_join_path_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["resolve_join_path_task"],  # type: ignore[index]
+            agent=self.schema_analyst(),
+            context=[self.analyze_schema_relevance_task()],
         )
 
     @task
@@ -213,7 +222,7 @@ class GameStudio:
         return Task(
             config=self.tasks_config["plan_query_dispatch_task"],  # type: ignore[index]
             agent=self.query_dispatcher(),
-            context=[self.analyze_schema_relevance_task()],
+            context=[self.analyze_schema_relevance_task(), self.resolve_join_path_task()],
         )
 
     @task
@@ -221,7 +230,13 @@ class GameStudio:
         return Task(
             config=self.tasks_config["analyze_and_compute_task"],  # type: ignore[index]
             agent=self.data_analyst(),
-            context=[self.plan_query_dispatch_task()],
+            context=[
+                self.normalize_question_task(),
+                self.extract_schema_task(),
+                self.analyze_schema_relevance_task(),
+                self.resolve_join_path_task(),
+                self.plan_query_dispatch_task()
+            ],
         )
 
     @task
@@ -237,14 +252,22 @@ class GameStudio:
         return Task(
             config=self.tasks_config["synthesize_response_task"],  # type: ignore[index]
             agent=self.response_synthesizer(),
-            context=[self.visual_report_task()],
+            context=[self.analyze_and_compute_task(), self.visual_report_task()],
             output_file="output/final_response.md",
         )
 
     @task
-    def generate_suggestions_task(self) -> Task:
+    def generate_followup_suggestions_task(self) -> Task:
         return Task(
-            config=self.tasks_config["generate_suggestions_task"],  # type: ignore[index]
+            config=self.tasks_config["generate_followup_suggestions_task"],  # type: ignore[index]
+            agent=self.suggestions_agent(),
+            context=[self.analyze_and_compute_task(), self.synthesize_response_task()],
+        )
+
+    @task
+    def suggest_initial_questions_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["suggest_initial_questions_task"],  # type: ignore[index]
             agent=self.suggestions_agent(),
         )
 
@@ -257,7 +280,7 @@ class GameStudio:
 
     @crew_project
     def crew(self) -> Crew:
-        """Creates the GameStudio analytical crew."""
+        """Creates the main GameStudio analytical crew."""
         return Crew(
             agents=[
                 self.question_normalizer(),
@@ -272,13 +295,16 @@ class GameStudio:
                 self.normalize_question_task(),
                 self.extract_schema_task(),
                 self.analyze_schema_relevance_task(),
+                self.resolve_join_path_task(),
                 self.plan_query_dispatch_task(),
                 self.analyze_and_compute_task(),
                 self.visual_report_task(),
-                self.synthesize_response_task()
+                self.synthesize_response_task(),
+                self.generate_followup_suggestions_task()
             ],
             process=Process.sequential,
-            verbose=True,
+            verbose=self._verbose,
+            tracing=True,
         )
 
     @crew_project
@@ -288,17 +314,19 @@ class GameStudio:
             agents=[self.db_connection_engineer(), self.table_data_extractor()],
             tasks=[self.validate_connection_task(), self.extract_table_data_task()],
             process=Process.sequential,
-            verbose=True,
+            verbose=self._verbose,
+            tracing=True,
         )
 
     @crew_project
     def suggestions_crew(self) -> Crew:
-        """Crew for generating follow-up suggestions."""
+        """Crew for generating initial analytical suggestions."""
         return Crew(
             agents=[self.suggestions_agent()],
-            tasks=[self.generate_suggestions_task()],
+            tasks=[self.suggest_initial_questions_task()],
             process=Process.sequential,
-            verbose=True,
+            verbose=self._verbose,
+            tracing=True,
         )
 
     @crew_project
@@ -308,5 +336,6 @@ class GameStudio:
             agents=[self.dashboard_architect()],
             tasks=[self.architect_dashboard_task()],
             process=Process.sequential,
-            verbose=True,
+            verbose=self._verbose,
+            tracing=True,
         )

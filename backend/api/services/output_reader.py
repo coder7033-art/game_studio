@@ -137,6 +137,16 @@ def list_reports() -> list[dict]:
     return sorted(reports, key=lambda r: r["name"])
 
 
+def read_suggestions_json() -> list[str]:
+    output_dir = get_output_dir()
+    data = read_json(output_dir / "suggestions.json")
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return [str(s) for s in data]
+    return []
+
+
 def read_report(report_id: str) -> str | None:
     output_dir = get_output_dir()
     f = output_dir / f"{report_id}.md"

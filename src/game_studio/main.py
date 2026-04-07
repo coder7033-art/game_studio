@@ -43,7 +43,8 @@ def run():
 
     try:
         # Analysis phase
-        print(f"--- Running Analysis for: {inputs['user_question']} ---")
+        if os.getenv("DEBUG_MODE", "False").lower() == "true":
+            print(f"--- Running Analysis for: {inputs['user_question']} ---")
         studio.crew().kickoff(inputs=inputs)
     except Exception as e:
         raise Exception(f"An error occurred while running the crew: {e}")

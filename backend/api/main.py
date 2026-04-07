@@ -66,6 +66,15 @@ async def lifespan(app: FastAPI):
             )
             print("Auto-connected via environment variable.")
 
+    # 3. Verify Redis connection
+    from backend.api.services.redis_cache import RedisCache
+    try:
+        client = RedisCache.get_client()
+        client.ping()
+        print("Successfully connected to Redis.")
+    except Exception as e:
+        print(f"Warning: Redis connection failed: {e}")
+
     yield
 
 

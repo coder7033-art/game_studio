@@ -26,8 +26,9 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysbd")
 # Stage markers — same as in ui.py
 _AGENT_STAGES = [
     {"id": "analyze",    "marker": "output/data_analysis.md"},
-    {"id": "synthesize", "marker": "output/final_response.md"},
     {"id": "visualize",  "marker": "output/visual_report.md"},
+    {"id": "synthesize", "marker": "output/final_response.md"},
+    {"id": "suggest",    "marker": "output/suggestions.json"},
 ]
 
 
@@ -69,6 +70,13 @@ def _clean_stage_outputs() -> None:
     if metrics_file.exists():
         try:
             metrics_file.unlink()
+        except Exception:
+            pass
+            
+    suggestions_file = output_dir / "suggestions.json"
+    if suggestions_file.exists():
+        try:
+            suggestions_file.unlink()
         except Exception:
             pass
 
@@ -172,10 +180,17 @@ async def run_crew_streaming(inputs: dict[str, Any]) -> asyncio.Queue:
                 raise last_error
 
             # Read outputs and build result event
-            answer, suggestions = read_final_answer()
+            # Read outputs and build result event
+            from backend.api.services.output_reader import read_suggestions_json
+            answer, md_suggestions = read_final_answer()
+            json_suggestions = read_suggestions_json()
+            
+            # Prefer integrated JSON suggestions from the new task
+            final_suggestions = json_suggestions if json_suggestions else md_suggestions
+            
             metrics = read_metrics()
             charts = read_charts()
-
+            
             loop.call_soon_threadsafe(
                 queue.put_nowait,
                 {
@@ -183,7 +198,7 @@ async def run_crew_streaming(inputs: dict[str, Any]) -> asyncio.Queue:
                     "answer": answer,
                     "metrics": metrics,
                     "charts": charts,
-                    "suggestions": suggestions,
+                    "suggestions": final_suggestions,
                 },
             )
         except Exception as exc:

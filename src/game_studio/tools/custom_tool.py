@@ -12,6 +12,11 @@ from sqlalchemy import MetaData, Table, create_engine, func, inspect, select, te
 
 
 from backend.api.services.clickhouse import get_clickhouse_client
+from backend.api.services import session_state
+from backend.api.services.redis_cache import RedisCache
+
+# Metadata Caching Policy
+CACHE_TTL_SECONDS = 3600  # 1 hour
 
 
 def _json_safe(value: Any) -> Any:
@@ -115,41 +120,61 @@ class GetClickHouseSchemaTool(BaseTool):
 
     def _run(self, table_names: Optional[List[str]] = None) -> str:
         try:
-            client = get_clickhouse_client()
+            state = session_state.get()
+            session_id = state.get("session_id", "dev")
             
-            # Filter by table names if provided
-            table_filter = ""
-            if table_names:
-                formatted_names = ", ".join([f"'{name}'" for name in table_names])
-                table_filter = f"AND table IN ({formatted_names})"
+            # Redis key for schema columns
+            redis_key = f"game_studio:cache:schema:{session_id}:columns"
+            cached_data = RedisCache.get(redis_key) or {"tables": {}}
+            
+            # Identify missing tables from cache
+            requested_tables = table_names or []
+            missing_tables = []
+            combined_schema = {}
+            
+            for tname in requested_tables:
+                t_cache = cached_data.get("tables", {}).get(tname)
+                if t_cache:
+                    combined_schema[tname] = t_cache.get("columns", [])
+                else:
+                    missing_tables.append(tname)
+            
+            # Fetch missing from DB
+            if not table_names or missing_tables:
+                client = get_clickhouse_client()
+                table_filter = ""
+                if missing_tables:
+                    formatted_names = ", ".join([f"'{name}'" for name in missing_tables])
+                    table_filter = f"AND table IN ({formatted_names})"
 
-            query = f"""
-                SELECT 
-                    table, 
-                    name, 
-                    type 
-                FROM system.columns 
-                WHERE database = currentDatabase() 
-                  AND table NOT LIKE 'system%'
-                  {table_filter}
-                ORDER BY table, position
-            """
-            result = client.query(query)
-            
-            schema = {}
-            for row in result.result_rows:
-                table_name, col_name, col_type = row
-                if table_name not in schema:
-                    schema[table_name] = []
-                schema[table_name].append({
-                    "column": col_name,
-                    "type": col_type
-                })
-            
+                query = f"""
+                    SELECT table, name, type 
+                    FROM system.columns 
+                    WHERE database = currentDatabase() AND table NOT LIKE 'system%' {table_filter}
+                    ORDER BY table, position
+                """
+                result = client.query(query)
+                
+                new_schema = {}
+                for row in result.result_rows:
+                    table_name, col_name, col_type = row
+                    new_schema.setdefault(table_name, []).append({"column": col_name, "type": col_type})
+                
+                # Merge into Redis cache
+                for tname, cols in new_schema.items():
+                    cached_data.setdefault("tables", {})[tname] = {
+                        "columns": cols,
+                        "last_updated": datetime.now().isoformat()
+                    }
+                    combined_schema[tname] = cols
+                
+                RedisCache.set(redis_key, cached_data, ttl=CACHE_TTL_SECONDS)
+
             return json.dumps({
                 "status": "success",
-                "tables_found": len(schema),
-                "schema": schema
+                "tables_found": len(combined_schema),
+                "schema": combined_schema,
+                "source": "redis" if combined_schema else "network"
             }, ensure_ascii=False, indent=2)
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2)
@@ -164,17 +189,31 @@ class GetClickHouseTableNamesTool(BaseTool):
     name: str = "get_clickhouse_table_names"
     description: str = (
         "Get a simple list of all available table names in the ClickHouse Data Warehouse. "
-        "Use this first to identify relevant tables before requesting detailed schemas."
+        "MANDATORY: Check your task context first. ONLY call this if no table names are found "
+        "in your analytical context. Redundant calls waste performance."
     )
     args_schema: Type[BaseModel] = GetClickHouseTableNamesInput
 
     def _run(self, dummy: str = "") -> str:
         try:
+            state = session_state.get()
+            session_id = state.get("session_id", "dev")
+            redis_key = f"game_studio:cache:schema:{session_id}:tables"
+            
+            cached_tables = RedisCache.get(redis_key)
+            if cached_tables:
+                return json.dumps({"status": "success", "tables": cached_tables, "source": "redis"}, ensure_ascii=False, indent=2)
+
+            # Fetch from DB
             client = get_clickhouse_client()
             query = "SELECT name FROM system.tables WHERE database = currentDatabase() AND name NOT LIKE 'system%'"
             result = client.query(query)
             tables = [row[0] for row in result.result_rows]
-            return json.dumps({"status": "success", "tables": tables}, ensure_ascii=False, indent=2)
+
+            # Update Redis cache
+            RedisCache.set(redis_key, tables, ttl=CACHE_TTL_SECONDS)
+
+            return json.dumps({"status": "success", "tables": tables, "source": "network"}, ensure_ascii=False, indent=2)
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2)
 
@@ -447,12 +486,19 @@ class SyncToClickHouseTool(BaseTool):
                         
                         client.insert(ch_table_name, data_matrix, column_names=col_names)
                     
-                    synced_tables.append({
-                        "original": table_name,
-                        "clickhouse_table": ch_table_name,
-                        "rows_synced": len(rows)
-                    })
-                    
+            # Save to shared artifact
+            try:
+                artifact_path = Path("output/schema_tables.json")
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                artifact_data = {
+                    "last_sync": datetime.now().isoformat(),
+                    "session_id": session_id,
+                    "tables": [t["clickhouse_table"] for t in synced_tables]
+                }
+                artifact_path.write_text(json.dumps(artifact_data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
             engine.dispose()
             return json.dumps({
                 "status": "success",
@@ -477,11 +523,70 @@ class ClickHouseQueryTool(BaseTool):
 
     def _run(self, sql_query: str) -> str:
         try:
-            if not sql_query.strip().upper().startswith("SELECT"):
-                return json.dumps({"error": "Only SELECT queries are allowed."})
+            normalized_query = sql_query.strip().upper()
+            
+            # 1. Prefix Check: Allow SELECT or WITH (for CTEs)
+            if not (normalized_query.startswith("SELECT") or normalized_query.startswith("WITH")):
+                return json.dumps({"error": "Only SELECT or WITH ... SELECT queries are allowed."})
+                
+            # 2. Forbidden Keyword Check: Prevent data-modifying or structural SQL
+            forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "RENAME"]
+            import re
+            tokens = re.findall(r"\b\w+\b", normalized_query)
+            if any(word in tokens for word in forbidden):
+                return json.dumps({"error": f"Security violation: Forbidden keywords ({', '.join(forbidden)}) found in query."})
                 
             client = get_clickhouse_client()
             
+            # 3. Preflight Check: Dry-run using EXPLAIN to catch schema/ref errors
+            try:
+                # Use EXPLAIN to check if the query is valid without executing
+                client.command(f"EXPLAIN {sql_query}")
+            except Exception as e:
+                import re
+                err_raw = str(e)
+                err_str = err_raw.upper()
+                error_type = "execution_failed"
+                failing_table = None
+                failing_column = None
+                suggested_next_action = "Review the SQL query for logical or syntax errors."
+                
+                # Regex patterns for ClickHouse common errors
+                # UNKNOWN_TABLE: Table db.table_name doesn't exist.
+                table_match = re.search(r"Table ([^ ]+) doesn't exist", err_raw, re.IGNORECASE)
+                if not table_match:
+                    table_match = re.search(r"UNKNOWN_TABLE: ([^ ]+)", err_raw, re.IGNORECASE)
+                
+                # UNKNOWN_IDENTIFIER: Unknown column 'col' in table 'tab'
+                col_match = re.search(r"Unknown column '([^']+)' in table '([^']+)'", err_raw, re.IGNORECASE)
+                if not col_match:
+                    col_match = re.search(r"Unknown identifier: ([^ ]+)", err_raw, re.IGNORECASE)
+
+                if "UNKNOWN_TABLE" in err_str or "NOT FOUND" in err_str or table_match:
+                    error_type = "missing_table"
+                    failing_table = table_match.group(1) if table_match else "unknown"
+                    suggested_next_action = f"Check `get_clickhouse_table_names` or the shared `schema_tables.json` artifact for the correct table name and prefix."
+                elif "UNKNOWN_IDENTIFIER" in err_str or "UNKNOWN COLUMN" in err_str or col_match:
+                    error_type = "missing_column"
+                    if col_match:
+                        failing_column = col_match.group(1)
+                        if len(col_match.groups()) > 1:
+                            failing_table = col_match.group(2)
+                    suggested_next_action = f"Run `get_clickhouse_schema` for the table '{failing_table or 'relevant tables'}' to verify existing column names."
+                elif "SYNTAX_ERROR" in err_str or "PARSER" in err_str:
+                    error_type = "syntax_error"
+                    suggested_next_action = "Review ClickHouse SQL syntax documentation, specifically for aggregations, window functions, or identifier quoting."
+                
+                return json.dumps({
+                    "status": "error",
+                    "error_type": error_type,
+                    "failing_table": failing_table,
+                    "failing_column": failing_column,
+                    "suggested_next_action": suggested_next_action,
+                    "details": err_raw
+                }, ensure_ascii=False, indent=2)
+
+            # 4. Actual Execution (Proceed only if EXPLAIN passed)
             result = client.query(sql_query)
             
             rows = []

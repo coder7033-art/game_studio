@@ -2,7 +2,7 @@ import os
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 
 from backend.api.models.database import ConnectRequest, StatusResponse
 from backend.api.services import session_state
@@ -12,31 +12,11 @@ router = APIRouter()
 CONFIG_FILE = Path(os.getenv("OUTPUT_DIR", "output")) / ".db_studio_config.json"
 
 
-def _run_setup_background(req: ConnectRequest) -> None:
-    from game_studio.crew import GameStudio
-    from backend.api.services import session_state
-    from backend.api.services.crew_runner import _reset_crewai_event_context
 
-    try:
-        session_state.update({"is_extracting": True})
-        _reset_crewai_event_context()
-        GameStudio().setup_crew().kickoff(inputs={
-            "connection_uri": req.connection_uri,
-            "database_type": req.database_type,
-            "schema_output_file": req.schema_output_file,
-            "data_output_file": req.data_output_file,
-            "max_rows_per_table": req.max_rows_per_table,
-            "report_format": req.report_format,
-        })
-        _reset_crewai_event_context()
-    except Exception as e:
-        print(f"Error running setup_crew: {e}")
-    finally:
-        session_state.update({"is_extracting": False})
 
 
 @router.post("/database/connect")
-async def connect_database(req: ConnectRequest, background_tasks: BackgroundTasks):
+async def connect_database(req: ConnectRequest):
     from game_studio.tools import ValidateDatabaseConnectionTool
 
     tool = ValidateDatabaseConnectionTool()
@@ -106,8 +86,7 @@ async def connect_database(req: ConnectRequest, background_tasks: BackgroundTask
         except Exception:
             pass
 
-        # Trigger extraction in the background
-        background_tasks.add_task(_run_setup_background, req)
+        # No longer triggering legacy extraction here
 
     state = session_state.get()
     return StatusResponse(

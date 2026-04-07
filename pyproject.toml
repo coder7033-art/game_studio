@@ -19,6 +19,7 @@ dependencies = [
     "sse-starlette>=2.1",
     "python-multipart>=0.0.12",
     "clickhouse-connect>=0.15.1",
+    "redis>=5.0.0",
 ]
 
 [project.scripts]

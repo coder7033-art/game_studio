@@ -35,19 +35,34 @@ extract_table_data_task:
 
 analyze_schema_relevance_task:
   description: >
-    Analyze the list of ClickHouse table names to identify which 2-3 tables are 
-    most relevant for answering the user's question: {user_question}.
-    If you need column details to be sure, list the tables you want to inspect.
+    Analyze the ClickHouse table names provided in your context to identify the minimal sufficient set of tables,
+    required join path, and specific columns needed to answer: {user_question}.
+    REUSE RULE: Use the list of tables already identified in the `extract_schema_task` output.
+    MANDATORY: Connection to the DB for discovery is PROHIBITED at this stage. 
+    Use the provided list or the `output/schema_tables.json` artifact only.
   expected_output: >
-    A list of 2-3 specific table names that are likely to contain the answer.
+    A structured JSON or organized Markdown including:
+    - tables: The set of tables to be used.
+    - join_path: The logic for connecting them.
+    - required_columns: The columns for each table.
+ 
+resolve_join_path_task:
+  description: >
+    Retrieve the detailed schema for the tables identified in the relevance task using `get_clickhouse_schema`.
+    Analyze the columns to identify foreign-key-like relationships and prove the join path
+    needed to answer: {user_question}.
+    Output the explicit join pairs (e.g. table_a.col_x -> table_b.col_y).
+  expected_output: >
+    A clear mapping of table relationships and join keys proving the link from fact to dimension.
 
 plan_query_dispatch_task:
   description: >
     Create a technical SQL query plan for: {user_question}
-    Based on the relevant schema identified, plan the exact SQL queries 
-    needed to compute the final answer.
+    Based STRICTLY on the relevant schema and join paths identified in the previous tasks.
+    Step 1: Use ONLY the tables and columns verified by `get_clickhouse_schema` or `resolve_join_path_task`.
+    Step 2: Do NOT assume or invent any column names. If a column is needed but missing from the verified schema, report it clearly.
+    Step 3: Plan the exact SELECT queries using only proven metadata.
     THE TABLES ARE IN CLICKHOUSE CLOUD. DO NOT ATTEMPT TO READ THEM AS LOCAL FILES. 
-    Use the table names identified in the relevance task.
   expected_output: >
     A structured SQL execution plan for ClickHouse.
 
@@ -57,23 +72,39 @@ analyze_and_compute_task:
 
     THE DATA IS ALREADY IN CLICKHOUSE. DO NOT ATTEMPT TO SYNC OR DOWNLOAD DATA.
 
-    Step 1 — Obtain the detailed schema for the RELEVANT tables only. 
-             Use `get_clickhouse_schema` providing the `table_names` identified in the relevance task.
-             Example: get_clickhouse_schema(table_names=["dev_film", "dev_category"])
-             This is CRITICAL for speed—never fetch all tables.
+    Step 1 — SAFETY CHECK:
+             Before executing any SQL, verify using the provided context that:
+             - The required tables are COMPLETE and were present in the initial discovery.
+             - Every column to be used has been VERIFIED by `get_clickhouse_schema`.
+             - The join path has been EXPLICITLY PROVEN by the `resolve_join_path_task`.
+             MANDATORY: Table discovery is ALREADY COMPLETE. Do not attempt to run any discovery tools.
+             IF ANY OF THESE ARE MISSING OR UNVERIFIED, STOP AND RETURN A FAILURE MESSAGE:
+             {{"status": "error", "reason": "incomplete_proof", "missing": ["tables", "columns", or "join_path"]}}
 
-    Step 2 — Use `clickhouse_query_tool` to compute the answer.
+    Step 2 — Use `clickhouse_query_tool` ONLY if the safety check passes.
              Write an optimized SELECT query to run against the ClickHouse Data Warehouse. 
              Use the prefixed ClickHouse table names (e.g. dev_table_name).
+    
+    Step 3 — FALLBACK & RECOVERY:
+             If `clickhouse_query_tool` returns a structured error (e.g. `missing_column`):
+             1. DO NOT guess the fixed identifier.
+             2. Use the `failing_table` and `suggested_next_action` from the error JSON.
+             3. Run `get_clickhouse_schema` for the specific failing table to expand your context.
+             4. Re-plan and execute the query EXACTLY ONCE based on the new schema information.
+             5. If the second attempt fails, return the error JSON as the final output.
              sql_query = <SELECT ... GROUP BY ...>
 
-    Step 3 — Report the exact numbers from the tool result. Never invent data.
-
+    Step 4 — DATA GROUNDING RULE:
+             At the end of your analysis, provide a concise "INTERNAL SUMMARY" of the core aggregates 
+             (e.g. Total Revenue, Average Rate). 
+             These numbers MUST be used by the visual_reporter to ensure 100% fidelity.
+    
     RULES:
     - NEVER simulate or guess numbers.
+    - DISTINCT RULE: When counting events (e.g. rentals, views) that are joined with payment or other transaction tables, ALWAYS use `COUNT(DISTINCT <id>)` to prevent data inflation from multiple records. 
     - AGGREGATION RULE: If answering a trend question (e.g., "Daily/Monthly sales"), and the number of days is large (> 40), you MUST aggregate the results by **Week** or **Month** using SQL logic or group-by.
   expected_output: >
-    A markdown report with the exact computed numbers from the tool.
+    A markdown report with a detailed result table and an internal grounding summary.
   markdown: true
 
 synthesize_response_task:
@@ -82,6 +113,12 @@ synthesize_response_task:
 
     Step 1 — Write a clear, professional markdown answer using real numbers from the analysis context.
              Use headers (###), bolding for key findings, and bullet points.
+
+    GROUNDING INTEGRITY RULES:
+    1. Check `analyze_and_compute_task` output. If it contains data rows (rows > 0), you MUST describe the findings. 
+       You are STRICTLY PROHIBITED from saying "data is missing" or "no details available" if the previous task found results.
+    2. Start with the core analytical findings, then explain any trends or categories.
+    3. Use the INTERNAL SUMMARY aggregates to ground your text answer.
 
     RULES:
     - Only use numbers from the analysis context — never invent data.
@@ -131,18 +168,21 @@ visual_report_task:
     - DATA DENSITY RULE: Limit any single chart to a maximum of **30-40 data points** to prevent technical failures and ensure readability.
     - For time-series data: If the daily data is too large, aggregate it by **Week** or **Month**.
     - For categories: If there are too many (e.g., more than 20), only show the **Top 15** and group others into "Other" or simply state they are the leading categories.
-    - Verification Step: Double-check that every float in save_chart_data and every value in save_metrics exists in the provided context results.
-    - The metrics argument is a STRING containing valid JSON, not a Python list.
-    - Keep metric labels short (2–4 words max).
-    - Produce 3–6 metrics that best summarize the answer.
+    PART C — GROUNDING RULE
+    You MUST use the exact aggregate numbers provided in the "INTERNAL SUMMARY" of 
+    the `analyze_and_compute_task` context. 
+    STRICT RULE: Do NOT include "Total Records" or "Row Count" as a KPI card unless 
+    the user explicitly asked for the count of records. Focus only on analytical metrics.
   expected_output: >
-    A markdown insight summary, with charts saved via save_chart_data and KPIs saved via save_metrics.
+    A markdown insight summary with charts and KPIs that MATCH the analysis context numbers.
   markdown: true
 
 architect_dashboard_task:
   description: >
-    Step 1: Discover table names using `get_clickhouse_table_names`.
+    Step 1: Use the already discovered table list from the analysis context. 
+    Only if it is missing, discover table names using `get_clickhouse_table_names`.
     Step 2: Identify 2-3 relevant tables and get their schema using `get_clickhouse_schema`.
+    Ensure you use the already retrieved schema if available in context.
     Step 3: Based on the user's dashboard request: "{user_question}",
     design the dashboard widgets according to the instructions in the request.
 
@@ -173,17 +213,24 @@ architect_dashboard_task:
   expected_output: >
     A valid JSON array of widget objects matching the requested structure.
 
-generate_suggestions_task:
+generate_followup_suggestions_task:
   description: >
-    Step 1: Discover table names using `get_clickhouse_table_names`.
-    Step 2: Generate exactly 4 short analytical follow-up questions...
- 
-    Conversation context:
-    - Last question asked: {user_question}
- 
-    Rules:
-    - Each question must be directly answerable from the database schema
-    - Each question must be under 12 words
-    - Output ONLY a valid JSON array of 4 strings, nothing else
+    Analyze the recent analysis result for: {user_question} 
+    Based on the findings (numbers, trends, categories), generate exactly 4 short, 
+    analytical follow-up questions.
+    Example: If the results show high revenue in "Action" films, suggest "What are the 
+    top actors in Action?" or "Monthly revenue trend for Action films?".
+    DO NOT generate schema browsing questions.
+    OUTPUT FORMAT: Return ONLY a JSON array of 4 strings.
   expected_output: >
-    A valid JSON array of exactly 4 question strings, with no extra text.
+    A valid JSON array of 4 follow-up analytical questions.
+  output_file: "output/suggestions.json"
+
+suggest_initial_questions_task:
+  description: >
+    Based on the discovered table names, generate 4 short, general analytical 
+    questions that a user might want to ask about this database.
+    Example: "What is the total revenue by rating?", "Show top 10 films by rentals".
+    OUTPUT FORMAT: Return ONLY a JSON array of 4 strings.
+  expected_output: >
+    A valid JSON array of 4 initial analytical questions.
